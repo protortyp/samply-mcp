@@ -41,10 +41,12 @@ pub fn build_call_tree(
         root.total_time += interval_ms;
         let mut node = &mut root;
 
+        let stack_len = sample.stack.len();
         for (depth, frame) in sample.stack.iter().enumerate() {
             if depth >= max_depth {
-                // Attribute remaining time as self-time of the deepest node
-                node.self_time += interval_ms;
+                // Stack is deeper than max_depth — stop descending but do NOT
+                // attribute this sample as self-time of the last visible node,
+                // since that node is not actually a leaf; the time is just hidden.
                 break;
             }
 
@@ -59,8 +61,8 @@ pub fn build_call_tree(
                 });
             node.total_time += interval_ms;
 
-            // If this is the leaf, attribute self-time
-            if depth == sample.stack.len() - 1 {
+            // Attribute self-time only to the true leaf frame of the sample
+            if depth == stack_len - 1 {
                 node.self_time += interval_ms;
             }
         }

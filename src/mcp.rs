@@ -93,13 +93,29 @@ fn find_thread<'a>(
     thread_name: &Option<String>,
 ) -> Option<&'a ResolvedThread> {
     match thread_name {
-        Some(name) => profile.threads.iter().find(|t| t.name == *name),
-        None => {
-            // Default: main thread, or first thread
+        Some(name) => {
+            // Try exact match first, then case-insensitive substring
             profile
                 .threads
                 .iter()
-                .find(|t| t.is_main)
+                .find(|t| t.name == *name)
+                .or_else(|| {
+                    let lower = name.to_lowercase();
+                    profile
+                        .threads
+                        .iter()
+                        .find(|t| t.name.to_lowercase().contains(&lower))
+                })
+        }
+        None => {
+            // Default: prefer the main thread that actually has samples (avoids picking
+            // the samply process itself which appears as an is_main thread with 0 samples)
+            profile
+                .threads
+                .iter()
+                .find(|t| t.is_main && !t.samples.is_empty())
+                .or_else(|| profile.threads.iter().find(|t| !t.samples.is_empty()))
+                .or_else(|| profile.threads.iter().find(|t| t.is_main))
                 .or(profile.threads.first())
         }
     }
@@ -124,11 +140,11 @@ pub struct TopFunctionsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
 
-    #[schemars(description = "Thread name to analyze (omit for main thread)")]
+    #[schemars(description = "Thread name to analyze (omit for main thread with most samples). Use profile_threads to list available thread names.")]
     #[serde(default)]
     pub thread: Option<String>,
 
-    #[schemars(description = "Sort by 'self' (default) or 'total' time")]
+    #[schemars(description = "Sort by 'self' / 'self_time' (default, CPU hotspots) or 'total' / 'total_time' (dominates call tree)")]
     #[serde(default = "default_sort_by")]
     pub sort_by: String,
 
@@ -150,7 +166,7 @@ pub struct CallTreeRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
 
-    #[schemars(description = "Thread name to analyze (omit for main thread)")]
+    #[schemars(description = "Thread name to analyze (omit for main thread with most samples). Use profile_threads to list names.")]
     #[serde(default)]
     pub thread: Option<String>,
 
@@ -185,7 +201,7 @@ pub struct MarkersRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
 
-    #[schemars(description = "Thread name (omit for main thread)")]
+    #[schemars(description = "Thread name to analyze (omit for main thread with most samples). Use profile_threads to list names.")]
     #[serde(default)]
     pub thread: Option<String>,
 
@@ -203,7 +219,7 @@ pub struct FlamegraphRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
 
-    #[schemars(description = "Thread name (omit for main thread)")]
+    #[schemars(description = "Thread name to analyze (omit for main thread with most samples). Use profile_threads to list names.")]
     #[serde(default)]
     pub thread: Option<String>,
 }
@@ -367,10 +383,12 @@ impl ProfileServer {
             .cloned()
             .unwrap_or_default();
 
-        if req.sort_by == "total" {
+        // Accept "total" or "total_time"; anything else defaults to self-time
+        let sort_by_total = matches!(req.sort_by.as_str(), "total" | "total_time");
+        if sort_by_total {
             stats.sort_by(|a, b| b.total_time_ms.partial_cmp(&a.total_time_ms).unwrap());
         }
-        // Default already sorted by self-time
+        // "self" / "self_time" / anything else → already sorted by self-time from cache
 
         let functions = stats
             .into_iter()
@@ -415,6 +433,29 @@ impl ProfileServer {
         let mut callers: HashMap<String, usize> = HashMap::new();
         let mut callees: HashMap<String, usize> = HashMap::new();
         let mut found_threads = Vec::new();
+
+        // Resolve to the actual full function name using exact match, then suffix, then substring
+        let resolved_name: String = {
+            let match_fn = |name: &str| -> bool {
+                name == target.as_str()
+                    || name.ends_with(&format!("::{target}"))
+                    || name.contains(target.as_str())
+            };
+            profile
+                .threads
+                .iter()
+                .find_map(|thread| {
+                    cached
+                        .cache
+                        .function_stats
+                        .get(&thread.name)?
+                        .iter()
+                        .find(|s| match_fn(&s.name))
+                        .map(|s| s.name.clone())
+                })
+                .unwrap_or_else(|| target.clone())
+        };
+        let target = &resolved_name;
 
         for thread in &profile.threads {
             // Check function stats
